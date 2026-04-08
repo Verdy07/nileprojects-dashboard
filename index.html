@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>NileProjects | Sales Intelligence Engine</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0B1120;font-family:'DM Sans',-apple-system,sans-serif;color:#E2E8F0;overflow:hidden;height:100vh}
+#root{height:100vh;display:flex;flex-direction:column}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes slideUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+input::placeholder{color:#8896AB}
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#1E2D3D;border-radius:3px}
+button{font-family:inherit}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script type="text/babel">
+const {useState,useRef,useEffect,useCallback}=React;
+
+const MAKE_WEBHOOK="https://hook.eu1.make.com/cvbepk1itfd42qd6g0uaniyglk19cb2x";
+const CLAUDE_API="/api/claude";
+const CLAUDE_MODEL="claude-sonnet-4-20250514";
+
+const SYSTEM_PROMPT=`You are the NileProjects Sales Intelligence Engine. You analyze sales data from Azure SQL for Nile Projects & Trading Company (Egypt).
+
+DATABASE SCHEMA:
+1. nileprojects_invoices (718,493 rows):
+   - channel, store, invoice_no, customer_name, customer_no, sku, category, payment_type, trx_date, unit_price, qty (float), total_price, discount_value
+   - total_price is AFTER discount. Revenue before discount = total_price + discount_value
+   - payment_type: Cash, Credit, Collect, Collect - Online, Return
+   - Date range: Jan 2024 – Dec 2025. Each row = one line item.
+
+2. nileprojects_products (1,187 rows):
+   - channel, sku, category, mtp_group, brand, origin, pattern, size
+   - mtp_group: PSR=Passenger, TBR=Truck, LVR/LSR=Light vehicle, Battery, Other
+   - Join: CAST(i.sku AS NVARCHAR(50)) = CAST(p.sku AS NVARCHAR(50))
+
+3. nileprojects_customers (614,761 rows):
+   - channel, customer_name, mobile_no, created_at, car_model, discount_provider, size
+   - One row per customer-car-size combination. mobile_no is primary identifier.
+
+CHANNELS:
+- Fit & Fix: Passenger cars, 71 stores, ~3.47B EGP
+- Kawitshagi: Trucks, 25 stores, ~990M EGP
+- BTTC: Combined, 6 stores, ~561M EGP
+
+CATEGORIES (Arabic): اطارات (Tires 78%), بطاريات (Batteries 14%), إكسسوار (Accessories 2.8%), بطاريات مستعملة (Used batteries 2.5%), زيوت (Oils 2%), قطع غيار (Spare parts), فلاتر (Filters)
+
+CRITICAL RULES:
+1. Revenue = SUM(total_price)
+2. ALWAYS: WHERE payment_type != 'Return'
+3. Count orders = COUNT(DISTINCT invoice_no)
+4. Monthly grouping: FORMAT(trx_date, 'yyyy-MM')
+5. Join products: JOIN ON CAST(i.sku AS NVARCHAR(50)) = CAST(p.sku AS NVARCHAR(50))
+6. ALL queries MUST wrap: SELECT (SELECT ... FOR JSON PATH) as result
+
+RESPONSE FORMAT — Step 1 (generate SQL):
+Respond with ONLY valid JSON, no markdown:
+{"thinking":"brief plan","sql":"SELECT (SELECT ... FOR JSON PATH) as result","followup":"suggested next question"}
+
+RESPONSE FORMAT — Step 2 (interpret results):
+When given query results, respond with ONLY valid JSON, no markdown:
+{"answer":"markdown analysis with **bold numbers**","chart":{"type":"bar|line|pie","title":"chart title","labels":["l1","l2"],"values":[1,2],"colors":["#4A7BF7","#6C93F8"]} or null}
+Use blue tones: #4A7BF7, #6C93F8, #8BAAF9, #3D6CE0, #2B5BCC. Format EGP with commas.`;
+
+const SUGGESTIONS=[
+  "What's the total revenue for 2024 vs 2025?",
+  "Top 10 stores by revenue this year",
+  "Monthly revenue trend for Fit & Fix",
+  "Which category grew the most in 2025?",
+  "Average order value by channel",
+  "Top 5 brands by units sold",
+  "Revenue by payment type breakdown",
+  "Seasonal patterns across all channels",
+];
+
+const C={
+  bg:"#0B1120",surface:"#111827",surfaceLight:"#1A2332",surfaceHover:"#1E293B",
+  border:"#1E2D3D",accent:"#4A7BF7",accentDim:"rgba(74,123,247,0.12)",
+  text:"#E2E8F0",textDim:"#8896AB",textMuted:"#5A6A7E",
+  success:"#34D399",white:"#FFFFFF",error:"#EF4444",purple:"#8B5CF6",amber:"#F59E0B",
+};
+
+const svgIcon=(type)=>{
+  const p={menu:'<line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>',
+    plus:'<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
+    close:'<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+    chat:'<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+    trash:'<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+    home:'<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
+  };
+  const s=type==='menu'?18:type==='close'?16:type==='home'?15:14;
+  return <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={type==='plus'?"2.5":"2"} strokeLinecap="round" strokeLinejoin="round" dangerouslySetInnerHTML={{__html:p[type]||''}}/>;
+};
+
+function StatCard({label,value,accent}){
+  return <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:"16px 20px",flex:"1 1 140px",minWidth:140,borderTop:`3px solid ${accent}`}}>
+    <div style={{fontSize:11,color:C.textDim,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>{label}</div>
+    <div style={{fontSize:22,fontWeight:700,color:C.text}}>{value}</div>
+  </div>;
+}
+
+function MarkdownText({text}){
+  if(!text)return null;
+  const parts=text.split(/(\*\*[^*]+\*\*)/g);
+  return <span>{parts.map((p,i)=>p.startsWith("**")&&p.endsWith("**")?<strong key={i} style={{color:C.accent,fontWeight:700}}>{p.slice(2,-2)}</strong>:<span key={i}>{p}</span>)}</span>;
+}
+
+function MiniChart({chart}){
+  if(!chart)return null;
+  const{type,title,labels,values,colors}=chart;
+  if(!labels||!values||values.length===0)return null;
+  const maxVal=Math.max(...values);
+  const total=values.reduce((a,b)=>a+b,0);
+  const fmt=(v)=>{if(v>=1e9)return(v/1e9).toFixed(2)+"B";if(v>=1e6)return(v/1e6).toFixed(1)+"M";if(v>=1e3)return(v/1e3).toFixed(1)+"K";return v.toLocaleString();};
+
+  if(type==="pie"){
+    const cx=100,cy=100,r=80;let cum=-Math.PI/2;
+    const slices=values.map((v,i)=>{const a=(v/total)*2*Math.PI;const x1=cx+r*Math.cos(cum),y1=cy+r*Math.sin(cum);cum+=a;const x2=cx+r*Math.cos(cum),y2=cy+r*Math.sin(cum);return{d:`M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${a>Math.PI?1:0} 1 ${x2},${y2} Z`,color:colors?.[i]||C.accent,label:labels[i],pct:((v/total)*100).toFixed(1)};});
+    return <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:20,marginTop:12}}>
+      <div style={{fontSize:13,fontWeight:600,color:C.textDim,marginBottom:12}}>{title}</div>
+      <div style={{display:"flex",alignItems:"center",gap:24,flexWrap:"wrap"}}>
+        <svg width={200} height={200} viewBox="0 0 200 200">{slices.map((s,i)=><path key={i} d={s.d} fill={s.color} stroke={C.bg} strokeWidth={2}/>)}</svg>
+        <div style={{display:"flex",flexDirection:"column",gap:6}}>{slices.map((s,i)=><div key={i} style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:C.text}}><div style={{width:10,height:10,borderRadius:2,background:s.color,flexShrink:0}}/><span>{s.label} ({s.pct}%)</span></div>)}</div>
+      </div>
+    </div>;
+  }
+
+  if(type==="line"){
+    const w=500,h=200,pad=40;const pw=(w-pad*2)/Math.max(values.length-1,1);
+    const pts=values.map((v,i)=>({x:pad+i*pw,y:h-pad-((v/maxVal)*(h-pad*2))}));
+    const pathD=pts.map((p,i)=>`${i===0?"M":"L"}${p.x},${p.y}`).join(" ");
+    return <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:20,marginTop:12,overflowX:"auto"}}>
+      <div style={{fontSize:13,fontWeight:600,color:C.textDim,marginBottom:12}}>{title}</div>
+      <svg viewBox={`0 0 ${w} ${h+20}`} style={{width:"100%",maxWidth:w}}>
+        <path d={pathD} fill="none" stroke={C.accent} strokeWidth={2.5} strokeLinejoin="round"/>
+        <path d={`${pathD} L${pts[pts.length-1].x},${h-pad} L${pts[0].x},${h-pad} Z`} fill={C.accentDim}/>
+        {pts.map((p,i)=><g key={i}><circle cx={p.x} cy={p.y} r={3.5} fill={C.accent}/><text x={p.x} y={h-pad+16} textAnchor="middle" fontSize={9} fill={C.textDim}>{labels[i]}</text><text x={p.x} y={p.y-10} textAnchor="middle" fontSize={9} fill={C.text}>{fmt(values[i])}</text></g>)}
+      </svg>
+    </div>;
+  }
+
+  const barW=Math.min(36,400/values.length),gap=Math.min(8,60/values.length);
+  const svgW=values.length*(barW+gap)+60,svgH=220,chartH=150;
+  return <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:20,marginTop:12,overflowX:"auto"}}>
+    <div style={{fontSize:13,fontWeight:600,color:C.textDim,marginBottom:12}}>{title}</div>
+    <svg viewBox={`0 0 ${svgW} ${svgH}`} style={{width:"100%",maxWidth:svgW}}>
+      {values.map((v,i)=>{const bh=(v/maxVal)*chartH,x=40+i*(barW+gap),y=chartH-bh+20;return<g key={i}><rect x={x} y={y} width={barW} height={bh} rx={3} fill={colors?.[i]||C.accent}/><text x={x+barW/2} y={y-6} textAnchor="middle" fontSize={9} fill={C.text}>{fmt(v)}</text><text x={x+barW/2} y={chartH+36} textAnchor="middle" fontSize={8} fill={C.textDim} transform={`rotate(-30,${x+barW/2},${chartH+36})`}>{labels[i]}</text></g>;})}
+    </svg>
+  </div>;
+}
+
+function Sidebar({open,onClose,sessions,activeId,onSelect,onNew,onDelete}){
+  const today=new Date().toDateString();
+  const yesterday=new Date(Date.now()-86400000).toDateString();
+  const grouped={Today:[],Yesterday:[],Earlier:[]};
+  sessions.forEach(s=>{const d=new Date(s.createdAt).toDateString();if(d===today)grouped.Today.push(s);else if(d===yesterday)grouped.Yesterday.push(s);else grouped.Earlier.push(s);});
+
+  return <>
+    {open&&<div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:90}}/>}
+    <div style={{position:"fixed",top:0,left:0,bottom:0,width:290,background:C.surface,borderRight:`1px solid ${C.border}`,zIndex:100,transform:open?"translateX(0)":"translateX(-100%)",transition:"transform 0.25s cubic-bezier(0.4,0,0.2,1)",display:"flex",flexDirection:"column"}}>
+      <div style={{padding:"14px 16px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <span style={{fontSize:14,fontWeight:700,color:C.white}}>Chat History</span>
+        <button onClick={onClose} style={{background:"none",border:"none",color:C.textDim,cursor:"pointer",padding:4,display:"flex"}}>{svgIcon('close')}</button>
+      </div>
+      <div style={{padding:"12px 12px 4px"}}>
+        <button onClick={()=>{onNew();onClose();}} style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8,width:"100%",padding:"10px 0",borderRadius:10,background:C.accentDim,border:`1px solid ${C.border}`,color:C.accent,fontSize:13,fontWeight:600,cursor:"pointer",transition:"all 0.15s"}}
+          onMouseEnter={e=>{e.currentTarget.style.background="rgba(74,123,247,0.2)";e.currentTarget.style.borderColor=C.accent;}}
+          onMouseLeave={e=>{e.currentTarget.style.background=C.accentDim;e.currentTarget.style.borderColor=C.border;}}
+        >{svgIcon('plus')} New Chat</button>
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"8px 12px"}}>
+        {Object.entries(grouped).map(([group,items])=>items.length>0&&<div key={group} style={{marginBottom:8}}>
+          <div style={{fontSize:10,fontWeight:600,color:C.textMuted,textTransform:"uppercase",letterSpacing:1.2,padding:"10px 10px 6px"}}>{group}</div>
+          {items.map(s=>{const isA=s.id===activeId;return<div key={s.id} onClick={()=>{onSelect(s.id);onClose();}}
+            style={{display:"flex",alignItems:"center",gap:10,padding:"9px 10px",borderRadius:8,cursor:"pointer",background:isA?C.accentDim:"transparent",border:`1px solid ${isA?"rgba(74,123,247,0.25)":"transparent"}`,transition:"all 0.15s",marginBottom:2}}
+            onMouseEnter={e=>{if(!isA)e.currentTarget.style.background=C.surfaceHover;}}
+            onMouseLeave={e=>{if(!isA)e.currentTarget.style.background=isA?C.accentDim:"transparent";}}>
+            <div style={{color:isA?C.accent:C.textMuted,flexShrink:0}}>{svgIcon('chat')}</div>
+            <div style={{flex:1,fontSize:13,color:isA?C.text:C.textDim,fontWeight:isA?600:400,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{s.title}</div>
+            <button onClick={e=>{e.stopPropagation();onDelete(s.id);}} style={{background:"none",border:"none",color:C.textMuted,cursor:"pointer",padding:4,display:"flex",opacity:0.3,transition:"opacity 0.15s"}}
+              onMouseEnter={e=>{e.currentTarget.style.opacity=1;e.currentTarget.style.color=C.error;}}
+              onMouseLeave={e=>{e.currentTarget.style.opacity=0.3;e.currentTarget.style.color=C.textMuted;}}
+            >{svgIcon('trash')}</button>
+          </div>;})}
+        </div>)}
+        {sessions.length===0&&<div style={{padding:"32px 10px",textAlign:"center",color:C.textMuted,fontSize:12,lineHeight:1.6}}>No chats yet.<br/>Ask a question to get started.</div>}
+      </div>
+      <div style={{padding:"12px 16px",borderTop:`1px solid ${C.border}`,fontSize:10,color:C.textMuted,textAlign:"center"}}>Azure SQL · Make.com · Claude API</div>
+    </div>
+  </>;
+}
+
+let nextId=1;
+
+function Dashboard(){
+  const[sessions,setSessions]=useState([]);
+  const[activeId,setActiveId]=useState(null);
+  const[input,setInput]=useState("");
+  const[loading,setLoading]=useState(false);
+  const[status,setStatus]=useState("connected");
+  const[sidebarOpen,setSidebarOpen]=useState(false);
+  const chatEndRef=useRef(null);
+
+  const activeSession=sessions.find(s=>s.id===activeId);
+  const messages=activeSession?.messages||[];
+  const isChat=messages.length>0;
+
+  useEffect(()=>{chatEndRef.current?.scrollIntoView({behavior:"smooth"});},[messages]);
+
+  const updateMessages=useCallback((id,fn)=>{
+    setSessions(prev=>prev.map(s=>s.id===id?{...s,messages:fn(s.messages)}:s));
+  },[]);
+
+  const callClaude=async(content)=>{
+    const res=await fetch(CLAUDE_API,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({model:CLAUDE_MODEL,max_tokens:1000,system:SYSTEM_PROMPT,messages:[{role:"user",content}]})});
+    const data=await res.json();
+    const text=data.content?.map(c=>c.text||"").join("")||"";
+    return JSON.parse(text.replace(/```json\s?|```/g,"").trim());
+  };
+
+  const callMake=async(sql)=>{
+    const res=await fetch(`${MAKE_WEBHOOK}?query=${encodeURIComponent(sql)}`);
+    return await res.text();
+  };
+
+  const handleSend=async(text)=>{
+    const question=text||input.trim();
+    if(!question||loading)return;
+    setInput("");
+    let sid=activeId;
+    if(!sid){
+      const s={id:"c"+(nextId++),title:question.length>55?question.slice(0,55)+"…":question,messages:[],createdAt:Date.now()};
+      setSessions(prev=>[s,...prev]);sid=s.id;setActiveId(sid);
+    }
+    updateMessages(sid,m=>[...m,{role:"user",text:question}]);
+    setLoading(true);setStatus("thinking");
+    try{
+      const step1=await callClaude(question);
+      updateMessages(sid,m=>[...m,{role:"thinking",text:step1.thinking}]);
+      setStatus("querying");
+      const sqlResult=await callMake(step1.sql);
+      setStatus("analyzing");
+      const step2=await callClaude(`Original question: "${question}"\nSQL used: ${step1.sql}\nQuery results: ${sqlResult}\n\nInterpret these results. Respond with JSON: {"answer":"markdown analysis","chart":{...} or null}`);
+      updateMessages(sid,m=>[...m,{role:"assistant",text:step2.answer,chart:step2.chart,followup:step1.followup}]);
+      setStatus("connected");
+    }catch(err){
+      updateMessages(sid,m=>[...m,{role:"error",text:`Error: ${err.message}. Check that the Make.com scenario is active.`}]);
+      setStatus("error");setTimeout(()=>setStatus("connected"),3000);
+    }
+    setLoading(false);
+  };
+
+  const handleNewChat=()=>{setActiveId(null);setInput("");setStatus("connected");};
+  const handleSelectSession=id=>{setActiveId(id);setStatus("connected");};
+  const handleDeleteSession=id=>{setSessions(prev=>prev.filter(s=>s.id!==id));if(activeId===id){setActiveId(null);setInput("");}};
+
+  const statusColor={connected:C.success,thinking:C.accent,querying:C.accent,analyzing:C.accent,error:C.error}[status];
+  const statusLabel={connected:"Connected to Azure SQL",thinking:"Generating query…",querying:"Running on Azure SQL…",analyzing:"Analyzing results…",error:"Connection error"}[status];
+
+  const hoverBtn=(e,enter)=>{e.currentTarget.style.borderColor=enter?C.accent:C.border;e.currentTarget.style.color=enter?C.text:C.textDim;};
+  const btnStyle={display:"flex",alignItems:"center",gap:6,padding:"6px 12px",background:C.accentDim,border:`1px solid ${C.border}`,borderRadius:8,color:C.textDim,fontSize:12,cursor:"pointer",fontWeight:500};
+
+  return <div style={{height:"100vh",background:C.bg,color:C.text,fontFamily:"'DM Sans',-apple-system,sans-serif",display:"flex",flexDirection:"column"}}>
+    <Sidebar open={sidebarOpen} onClose={()=>setSidebarOpen(false)} sessions={sessions} activeId={activeId} onSelect={handleSelectSession} onNew={handleNewChat} onDelete={handleDeleteSession}/>
+
+    {/* Header */}
+    <div style={{padding:"12px 20px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",justifyContent:"space-between",background:C.surface,flexShrink:0}}>
+      <div style={{display:"flex",alignItems:"center",gap:12}}>
+        <button onClick={()=>setSidebarOpen(true)} style={{background:"none",border:"none",color:C.textDim,cursor:"pointer",padding:6,borderRadius:6,display:"flex"}}
+          onMouseEnter={e=>e.currentTarget.style.color=C.text} onMouseLeave={e=>e.currentTarget.style.color=C.textDim}>
+          {svgIcon('menu')}
+        </button>
+        <span style={{fontSize:15,fontWeight:700,color:C.white}}>NileProjects</span>
+        <span style={{fontSize:13,color:C.textMuted}}>|</span>
+        <span style={{fontSize:13,color:C.textDim,fontWeight:500}}>Sales Intelligence Engine</span>
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        {isChat&&<>
+          <button onClick={handleNewChat} style={btnStyle} onMouseEnter={e=>hoverBtn(e,true)} onMouseLeave={e=>hoverBtn(e,false)}>{svgIcon('home')} <span>Home</span></button>
+          <button onClick={handleNewChat} style={btnStyle} onMouseEnter={e=>hoverBtn(e,true)} onMouseLeave={e=>hoverBtn(e,false)}>{svgIcon('plus')} <span>New Chat</span></button>
+        </>}
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <div style={{width:7,height:7,borderRadius:"50%",background:statusColor,boxShadow:`0 0 8px ${statusColor}`,animation:status!=="connected"&&status!=="error"?"pulse 1.5s infinite":"none"}}/>
+          <span style={{fontSize:11,color:statusColor,fontWeight:500}}>{statusLabel}</span>
+        </div>
+      </div>
+    </div>
+
+    {/* Main */}
+    <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+      {!isChat?
+        <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"40px 24px",animation:"fadeIn 0.5s ease"}}>
+          <div style={{textAlign:"center",maxWidth:640,width:"100%"}}>
+            <h1 style={{fontSize:28,fontWeight:700,color:C.white,margin:0,lineHeight:1.3}}>Your data knows things</h1>
+            <h1 style={{fontSize:28,fontWeight:700,color:C.accent,margin:"0 0 12px",lineHeight:1.3}}>you haven't asked yet.</h1>
+            <p style={{fontSize:14,color:C.textDim,margin:"0 0 28px",letterSpacing:0.3}}>5 billion EGP · 718K invoices · 102 stores · 2 years of hidden patterns</p>
+            <div style={{display:"flex",gap:12,flexWrap:"wrap",marginBottom:28,justifyContent:"center"}}>
+              <StatCard label="Revenue" value="5.02B" accent="#4A7BF7"/>
+              <StatCard label="Invoices" value="718K" accent="#6C93F8"/>
+              <StatCard label="Stores" value="102" accent="#34D399"/>
+              <StatCard label="Customers" value="615K" accent="#8B5CF6"/>
+            </div>
+            <div style={{display:"flex",gap:8,background:C.surfaceLight,border:`1px solid ${input?C.accent:C.border}`,borderRadius:14,padding:6,transition:"border-color 0.2s"}}>
+              <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleSend()}
+                placeholder="Ask anything about your sales data…"
+                style={{flex:1,background:"transparent",border:"none",outline:"none",color:C.text,fontSize:14,padding:"10px 14px",fontFamily:"inherit"}}/>
+              <button onClick={()=>handleSend()} disabled={!input.trim()} style={{padding:"10px 24px",borderRadius:10,border:"none",background:input.trim()?C.accent:C.border,color:input.trim()?C.white:C.textDim,fontWeight:600,fontSize:14,cursor:input.trim()?"pointer":"default",transition:"all 0.2s"}}>Ask</button>
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:8,marginTop:20,justifyContent:"center"}}>
+              {SUGGESTIONS.map((s,i)=><button key={i} onClick={()=>handleSend(s)} style={{padding:"7px 14px",borderRadius:20,background:C.accentDim,border:`1px solid ${C.border}`,color:C.textDim,fontSize:12,cursor:"pointer",transition:"all 0.2s"}}
+                onMouseEnter={e=>{e.target.style.borderColor=C.accent;e.target.style.color=C.text;}}
+                onMouseLeave={e=>{e.target.style.borderColor=C.border;e.target.style.color=C.textDim;}}
+              >{s}</button>)}
+            </div>
+          </div>
+        </div>
+      :
+        <>
+          <div style={{flex:1,overflowY:"auto",padding:"20px 24px"}}>
+            {messages.map((msg,i)=><div key={i} style={{marginBottom:16,animation:"slideUp 0.3s ease",display:"flex",justifyContent:msg.role==="user"?"flex-end":"flex-start"}}>
+              {msg.role==="user"?
+                <div style={{background:C.accent,color:C.white,padding:"10px 18px",borderRadius:"16px 16px 4px 16px",maxWidth:"70%",fontSize:14,fontWeight:500}}>{msg.text}</div>
+              :msg.role==="thinking"?
+                <div style={{background:C.surface,border:`1px solid ${C.border}`,borderLeft:`3px solid ${C.accent}`,padding:"10px 16px",borderRadius:"4px 12px 12px 4px",maxWidth:"80%",fontSize:13,color:C.textDim,fontStyle:"italic"}}>{msg.text}</div>
+              :msg.role==="error"?
+                <div style={{background:"rgba(239,68,68,0.1)",border:"1px solid rgba(239,68,68,0.3)",padding:"10px 16px",borderRadius:12,maxWidth:"80%",fontSize:13,color:"#FCA5A5"}}>{msg.text}</div>
+              :
+                <div style={{maxWidth:"85%",width:"100%"}}>
+                  <div style={{background:C.surface,border:`1px solid ${C.border}`,padding:"16px 20px",borderRadius:12,fontSize:14,lineHeight:1.7,color:C.text}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+                      <div style={{width:22,height:22,borderRadius:6,background:C.accentDim,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,color:C.accent,fontWeight:700}}>N</div>
+                      <span style={{fontSize:12,fontWeight:600,color:C.textDim}}>NileProjects AI</span>
+                    </div>
+                    {msg.text.split("\n").map((line,j)=><p key={j} style={{margin:"4px 0"}}><MarkdownText text={line}/></p>)}
+                  </div>
+                  {msg.chart&&<MiniChart chart={msg.chart}/>}
+                  {msg.followup&&<button onClick={()=>handleSend(msg.followup)} style={{marginTop:8,padding:"6px 14px",borderRadius:16,background:C.accentDim,border:`1px solid ${C.border}`,color:C.textDim,fontSize:12,cursor:"pointer",transition:"all 0.15s"}}
+                    onMouseEnter={e=>{e.target.style.borderColor=C.accent;e.target.style.color=C.text;}}
+                    onMouseLeave={e=>{e.target.style.borderColor=C.border;e.target.style.color=C.textDim;}}
+                  >{msg.followup}</button>}
+                </div>
+              }
+            </div>)}
+            {loading&&<div style={{display:"flex",gap:6,padding:"8px 0",animation:"fadeIn 0.3s"}}>
+              {[0,1,2].map(i=><div key={i} style={{width:8,height:8,borderRadius:"50%",background:C.accent,animation:`pulse 1.2s infinite ${i*0.2}s`}}/>)}
+            </div>}
+            <div ref={chatEndRef}/>
+          </div>
+          <div style={{padding:"12px 24px 16px",borderTop:`1px solid ${C.border}`,background:C.surface,flexShrink:0}}>
+            <div style={{display:"flex",gap:8,background:C.surfaceLight,border:`1px solid ${input?C.accent:C.border}`,borderRadius:14,padding:6,transition:"border-color 0.2s"}}>
+              <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleSend()}
+                placeholder="Ask a follow-up question…" disabled={loading}
+                style={{flex:1,background:"transparent",border:"none",outline:"none",color:C.text,fontSize:14,padding:"10px 14px",fontFamily:"inherit"}}/>
+              <button onClick={()=>handleSend()} disabled={!input.trim()||loading} style={{padding:"10px 24px",borderRadius:10,border:"none",background:input.trim()&&!loading?C.accent:C.border,color:input.trim()&&!loading?C.white:C.textDim,fontWeight:600,fontSize:14,cursor:input.trim()&&!loading?"pointer":"default",transition:"all 0.2s"}}>Ask</button>
+            </div>
+          </div>
+        </>
+      }
+    </div>
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<Dashboard/>);
+</script>
+</body>
+</html>
